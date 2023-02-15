@@ -31,6 +31,12 @@ inline size_t get_devices_count() {
   return static_cast<size_t>(count);
 }
 
+inline size_t get_current_device_id() {
+  int dev_id = 0;
+  PADDLE_ENFORCE_MLU_SUCCESS(cnrtGetDevice(&dev_id));
+  return dev_id;
+}
+
 }  // namespace
 
 // Device
@@ -460,6 +466,122 @@ C_Status XcclRecv(void *recv_buf,
   return C_SUCCESS;
 }
 
+// ENV_string(mlu_profiling_dir, "mlu_profiling");
+// ENV_uint64(mlu_profiling_data_type,
+//            CNPAPI_ACTIVITY_TYPE_CNDRV_API | ACL_PROF_TASK_TIME |
+//            ACL_PROF_AICORE_METRICS | ACL_PROF_AICPU |
+//            CNPAPI_ACTIVITY_TYPE_CNCL_API | CNPAPI_ACTIVITY_TYPE_CNRT_API);
+// ENV_uint64(mlu_profiling_metrics,
+//            static_cast<uint64_t>(ACL_AICORE_ARITHMETIC_UTILIZATION));
+inline void *AlignedMalloc(size_t size, size_t alignment) {
+  assert(alignment >= sizeof(void *) && (alignment & (alignment - 1)) == 0);
+  size = (size + alignment - 1) / alignment * alignment;
+#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
+  void *aligned_mem = nullptr;
+  if (posix_memalign(&aligned_mem, alignment, size) != 0) {
+    aligned_mem = nullptr;
+  }
+  return aligned_mem;
+#elif defined(_WIN32)
+  return _aligned_malloc(size, alignment);
+#else
+  void *mem = malloc(size + alignment);
+  if (mem == nullptr) {
+    return nullptr;
+  }
+  size_t adjust = alignment - reinterpret_cast<uint64_t>(mem) % alignment;
+  void *aligned_mem = reinterpret_cast<char *>(mem) + adjust;
+  *(reinterpret_cast<void **>(aligned_mem) - 1) = mem;
+  assert(reinterpret_cast<uint64_t>(aligned_mem) % alignment == 0);
+  return aligned_mem;
+#endif
+}
+
+inline void AlignedFree(void *mem_ptr) {
+#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
+  free(mem_ptr);
+#elif defined(_WIN32)
+  _aligned_free(mem_ptr);
+#else
+  if (mem_ptr) {
+    free(*(reinterpret_cast<void **>(mem_ptr) - 1));
+  }
+#endif
+}
+
+namespace {
+void BufferRequestedCallback(uint64_t **buffer,
+                             size_t *size,
+                             size_t *max_num_records) {
+  constexpr size_t kBufferSize = 1 << 23;  // 8 MB
+  constexpr size_t kBufferAlignSize = 8;
+  *buffer = reinterpret_cast<uint64_t *>(
+      AlignedMalloc(kBufferSize, kBufferAlignSize));
+  *size = kBufferSize;
+  *max_num_records = 0;
+}
+
+void BufferCompletedCallback(uint64_t *buffer, size_t size, size_t valid_size) {
+  if (buffer == nullptr || valid_size == 0) {
+    return;
+  }
+  auto mlu_profiler = &MLUProfiler::Instance();
+  mlu_profiler->ProcessCnpapiActivity(buffer, valid_size);
+
+  AlignedFree(buffer);
+}
+}  // namespace
+
+// define constructor of MLUProfiler, do registration of callback function
+MLUProfiler::MLUProfiler() {
+  CNPAPI_CALL(cnpapiInit());
+  CNPAPI_CALL(cnpapiActivityRegisterCallbacks(BufferRequestedCallback,
+                                              BufferCompletedCallback));
+}
+
+C_Status ProfilerInitialize(C_Profiler prof, void **user_data) {
+  std::vector<uint32_t> device_ids(
+      {static_cast<uint32_t>(get_current_device_id())});
+  MLUProfiler::Instance().update_config(device_ids);
+  // MLUProfiler::Instance().update_config(
+  //     device_ids,
+  //     static_cast<aclprofAicoreMetrics>(FLAGS_mlu_profiling_metrics),
+  //     nullptr,
+  //     FLAGS_mlu_profiling_data_type);
+  // ACL_CHECK(aclprofInit(FLAGS_mlu_profiling_dir.c_str(),
+  //                       FLAGS_mlu_profiling_dir.size()));
+  return C_SUCCESS;
+}
+
+C_Status ProfilerFinalize(C_Profiler prof, void *user_data) {
+  MLUProfiler::Instance().stop();
+  // MLUProfiler::Instance().destroy_config();
+  // ACL_CHECK(aclprofFinalize());
+  return C_SUCCESS;
+}
+
+C_Status ProfilerPrepare(C_Profiler prof, void *user_data) {
+  MLUProfiler::Instance().Prepare();
+  LOG(INFO) << "[ProfilerPrepare] Init MLU profiler done.";
+  return C_SUCCESS;
+}
+
+C_Status ProfilerStart(C_Profiler prof, void *user_data) {
+  MLUProfiler::Instance().start();
+  return C_SUCCESS;
+}
+
+C_Status ProfilerStop(C_Profiler prof, void *user_data) {
+  MLUProfiler::Instance().stop();
+  return C_SUCCESS;
+}
+
+C_Status ProfilerCollectData(C_Profiler prof,
+                             uint64_t tracing_start_ns_,
+                             void *user_data) {
+  return C_SUCCESS;
+}
+
 void InitPlugin(CustomRuntimeParams *params) {
   PADDLE_CUSTOM_RUNTIME_CHECK_VERSION(params);
 
@@ -522,4 +644,12 @@ void InitPlugin(CustomRuntimeParams *params) {
   params->interface->xccl_group_end = XcclGroupEnd;
   params->interface->xccl_send = XcclSend;
   params->interface->xccl_recv = XcclRecv;
+
+  // profiler
+  params->interface->profiler_collect_trace_data = ProfilerCollectData;
+  params->interface->profiler_initialize = ProfilerInitialize;
+  params->interface->profiler_finalize = ProfilerFinalize;
+  params->interface->profiler_start_tracing = ProfilerStart;
+  params->interface->profiler_stop_tracing = ProfilerStop;
+  params->interface->profiler_prepare_tracing = ProfilerPrepare;
 }

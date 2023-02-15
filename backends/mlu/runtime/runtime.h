@@ -14,14 +14,19 @@
 
 #pragma once
 
+#ifdef _POSIX_C_SOURCE
+#include <time.h>
+#endif
 #include <cncl.h>
 #include <cnnl.h>
-#include <mlu_op.h>
 #include <cnpapi.h>
 #include <cnrt.h>
+#include <mlu_op.h>
 
 #include "glog/logging.h"
+#include "paddle/phi/backends/device_base.h"
 #include "paddle/phi/extension.h"
+#include "runtime/cnpapi_data_process.h"
 
 template <typename T>
 struct CustomMLUStatusType {};
@@ -32,6 +37,26 @@ struct CustomMLUStatusType {};
     using Type = type;                                     \
     static constexpr Type kSuccess = success_value;        \
   }
+#define ENV_Cat(x, y) x##y
+#define ENV_Str(x) #x
+#define ENV_Call(x, y) x(y)
+#define ENV_DEFINE(type, name, value, parser)                        \
+  type FLAGS_##name =                                                \
+      getenv(ENV_Call(ENV_Str, ENV_Cat(FLAGS_, name)))               \
+          ? parser(getenv(ENV_Call(ENV_Str, ENV_Cat(FLAGS_, name)))) \
+          : value
+#define ENV_uint64(x, value) ENV_DEFINE(uint64_t, x, value, std::stoul)
+#define ENV_string(x, value) ENV_DEFINE(std::string, x, value, std::string)
+
+#define CNPAPI_CALL(call)                                                    \
+  do {                                                                       \
+    cnpapiResult _status = call;                                             \
+    if (_status != CNPAPI_SUCCESS) {                                         \
+      const char *errstr;                                                    \
+      cnpapiGetResultString(_status, &errstr);                               \
+      LOG(ERROR) << "Function " << #call << " failed with error " << errstr; \
+    }                                                                        \
+  } while (0)
 
 DEFINE_CUSTOM_MLU_STATUS_TYPE(cnrtRet_t, cnrtSuccess);
 DEFINE_CUSTOM_MLU_STATUS_TYPE(cnnlStatus_t, CNNL_STATUS_SUCCESS);
@@ -59,16 +84,15 @@ inline std::string build_mlu_error_msg(cnnlStatus_t stat) {
 }
 
 /*************** MLUOP ERROR ***************/
-inline bool is_error(mluOpStatus_t stat) { return stat != MLUOP_STATUS_SUCCESS; }
+inline bool is_error(mluOpStatus_t stat) {
+  return stat != MLUOP_STATUS_SUCCESS;
+}
 
 inline std::string build_mlu_error_msg(mluOpStatus_t stat) {
   std::ostringstream sout;
-  sout << "MLU OP error(" << stat << "), " << mluOpGetErrorString(stat)
-       << ". ";
+  sout << "MLU OP error(" << stat << "), " << mluOpGetErrorString(stat) << ". ";
   return sout.str();
 }
-
-
 
 /*************** CNCL ERROR ***************/
 inline bool is_error(cnclResult_t e) { return e != CNCL_RET_SUCCESS; }
@@ -146,3 +170,169 @@ C_Status AsyncMemCpyD2H(const C_Device device,
                         void *dst,
                         const void *src,
                         size_t size);
+
+// Get system-wide realtime clock in nanoseconds
+inline uint64_t PosixInNsec() {
+#ifdef _POSIX_C_SOURCE
+  struct timespec tp;
+  clock_gettime(CLOCK_REALTIME, &tp);
+  return tp.tv_sec * 1000 * 1000 * 1000 + tp.tv_nsec;
+#else
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return 1000 * (static_cast<uint64_t>(tv.tv_sec) * 1000000 + tv.tv_usec);
+#endif
+}
+
+class MLUProfiler {
+ public:
+  static MLUProfiler &Instance() {
+    static MLUProfiler instance;
+    return instance;
+  }
+
+  MLUProfiler();
+
+  ~MLUProfiler() {
+    // destroy_step_info();
+    // destroy_config();
+  }
+
+  void update_config(std::vector<uint32_t> device_ids) {
+    devices_ids_ = device_ids;
+    // metrics_ = metrics;
+    // data_type_ = type;
+  }
+
+  void Prepare() { EnableCnpapiActivity(); }
+
+  // void destroy_config() {
+  //   if (config_) {
+  //     ACL_CHECK(aclprofDestroyConfig(config_));
+  //     config_ = nullptr;
+  //   }
+  // }
+
+  // aclprofConfig *get_config() {
+  //   if (config_ == nullptr) {
+  //     config_ = aclprofCreateConfig(devices_ids_.data(),
+  //                                   devices_ids_.size(),
+  //                                   metrics_,
+  //                                   nullptr,
+  //                                   data_type_);
+  //   }
+  //   return config_;
+  // }
+
+  // aclprofStepInfo *get_step_info() {
+  //   if (step_info_ == nullptr) {
+  //     step_info_ = aclprofCreateStepInfo();
+  //   }
+  //   return step_info_;
+  // }
+
+  // void destroy_step_info() {
+  //   if (step_info_) {
+  //     aclprofDestroyStepInfo(step_info_);
+  //     step_info_ = nullptr;
+  //   }
+  // }
+
+  // void update_stream(aclrtStream stream) {
+  //   if (stream_ == nullptr) {
+  //     stream_ = stream;
+  //     if (step_info_) {
+  //       ACL_CHECK(aclprofGetStepTimestamp(step_info_, ACL_STEP_START,
+  //       stream_));
+  //     }
+  //   }
+  // }
+
+  // aclrtStream get_stream() { return stream_; }
+
+  // void clear_stream() { stream_ = nullptr; }
+
+  void EnableCnpapiActivity() {
+    CNPAPI_CALL(cnpapiActivityEnable(CNPAPI_ACTIVITY_TYPE_KERNEL));
+    CNPAPI_CALL(cnpapiActivityEnable(CNPAPI_ACTIVITY_TYPE_MEMCPY));
+    CNPAPI_CALL(cnpapiActivityEnable(CNPAPI_ACTIVITY_TYPE_MEMCPY_PTOP));
+    CNPAPI_CALL(cnpapiActivityEnable(CNPAPI_ACTIVITY_TYPE_MEMSET));
+    CNPAPI_CALL(cnpapiActivityEnable(CNPAPI_ACTIVITY_TYPE_CNDRV_API));
+    VLOG(3) << "enable cnpapi activity";
+  }
+
+  void DisableCnpapiActivity() {
+    CNPAPI_CALL(cnpapiActivityFlushAll());
+    CNPAPI_CALL(cnpapiActivityDisable(CNPAPI_ACTIVITY_TYPE_KERNEL));
+    CNPAPI_CALL(cnpapiActivityDisable(CNPAPI_ACTIVITY_TYPE_MEMCPY));
+    CNPAPI_CALL(cnpapiActivityDisable(CNPAPI_ACTIVITY_TYPE_MEMCPY_PTOP));
+    CNPAPI_CALL(cnpapiActivityDisable(CNPAPI_ACTIVITY_TYPE_MEMSET));
+    CNPAPI_CALL(cnpapiActivityDisable(CNPAPI_ACTIVITY_TYPE_CNDRV_API));
+    VLOG(3) << "disable cnpapi activity";
+  }
+
+  void start() {
+    if (!start_) {
+      tracing_start_ns_ = PosixInNsec();
+      // ACL_CHECK(aclrtSynchronizeDevice());
+      // ACL_CHECK(aclprofStart(MLUProfiler::Instance().get_config()));
+      start_ = true;
+    }
+  }
+
+  void stop() {
+    if (start_) {
+      DisableCnpapiActivity();
+      // state_ = TracerState::STOPED;
+      //     ACL_CHECK(aclrtSynchronizeDevice());
+      //     ACL_CHECK(aclprofStop(MLUProfiler::Instance().get_config()));
+      start_ = false;
+    }
+  }
+
+  void ProcessCnpapiActivity(uint64_t *buffer, size_t valid_size) {
+    cnpapiActivity *record = nullptr;
+    while (true) {
+      cnpapiResult status =
+          cnpapiActivityGetNextRecord(buffer, valid_size, &record);
+      if (status == CNPAPI_SUCCESS) {
+        details::ProcessCnpapiActivityRecord(
+            record, tracing_start_ns_, collector_);
+      } else if (status == CNPAPI_ERROR_INSUFFICIENT_MEMORY ||
+                 status == CNPAPI_ERROR_MAX_LIMIT_REACHED) {
+        break;
+      } else {
+        CNPAPI_CALL(status);
+      }
+    }
+  }
+
+  // void step_start() {
+  //   get_step_info();
+  //   if (stream_ && step_info_) {
+  //     ACL_CHECK(aclprofGetStepTimestamp(step_info_, ACL_STEP_START,
+  //     stream_));
+  //   }
+  // }
+
+  // void step_stop() {
+  //   if (stream_ && step_info_) {
+  //     ACL_CHECK(aclprofGetStepTimestamp(step_info_, ACL_STEP_END, stream_));
+  //   }
+  //   destroy_step_info();
+  // }
+
+ private:
+  uint64_t tracing_start_ns_ = UINT64_MAX;
+
+  paddle::platform::TraceEventCollector *collector_;
+  std::vector<uint32_t> devices_ids_;
+  // aclprofAicoreMetrics metrics_;
+  // uint64_t data_type_;
+
+  // aclprofConfig *config_ = nullptr;
+  // aclprofStepInfo *step_info_ = nullptr;
+  // aclrtStream stream_ = nullptr;
+
+  bool start_ = false;
+};
